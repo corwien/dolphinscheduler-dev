@@ -48,13 +48,8 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.MessageFormat;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Optional;
-import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -92,6 +87,11 @@ public class SqlTask extends AbstractTaskExecutor {
     private static final int QUERY_LIMIT = 10000;
 
     /**
+     * 多条SQL语句分格符，3.1分隔符为";\n",这里直接和hive server 的统一，为";"
+     */
+    private static final String SQL_SEPARATOR = ";";
+
+    /**
      * Abstract Yarn Task
      *
      * @param taskRequest taskRequest
@@ -126,6 +126,8 @@ public class SqlTask extends AbstractTaskExecutor {
                 sqlParameters.getConnParams(),
                 sqlParameters.getVarPool(),
                 sqlParameters.getLimit());
+
+        String separator = SQL_SEPARATOR;
         try {
             SQLTaskExecutionContext sqlTaskExecutionContext = taskExecutionContext.getSqlTaskExecutionContext();
 
@@ -135,7 +137,12 @@ public class SqlTask extends AbstractTaskExecutor {
                     sqlTaskExecutionContext.getConnectionParams());
 
             // ready to execute SQL and parameter entity Map
-            SqlBinds mainSqlBinds = getSqlAndSqlParamsMap(sqlParameters.getSql());
+            // SqlBinds mainSqlBinds = getSqlAndSqlParamsMap(sqlParameters.getSql());  // 注释掉原有的方法
+            List<SqlBinds> mainStatementSqlBinds = split(sqlParameters.getSql(), separator)
+                    .stream()
+                    .map(this::getSqlAndSqlParamsMap)
+                    .collect(Collectors.toList());
+
             List<SqlBinds> preStatementSqlBinds = Optional.ofNullable(sqlParameters.getPreStatements())
                     .orElse(new ArrayList<>())
                     .stream()
@@ -151,7 +158,7 @@ public class SqlTask extends AbstractTaskExecutor {
                     sqlTaskExecutionContext.getDefaultFS(), logger);
 
             // execute sql task
-            executeFuncAndSql(mainSqlBinds, preStatementSqlBinds, postStatementSqlBinds, createFuncs);
+            executeFuncAndSql(mainStatementSqlBinds, preStatementSqlBinds, postStatementSqlBinds, createFuncs);
 
             setExitStatusCode(TaskConstants.EXIT_CODE_SUCCESS);
 
@@ -163,20 +170,45 @@ public class SqlTask extends AbstractTaskExecutor {
     }
 
     /**
+     * split sql by segment separator
+     * <p>The segment separator is used
+     * when the data source does not support multi-segment SQL execution,
+     * and the client needs to split the SQL and execute it multiple times.</p>
+     * @param sql
+     * @param segmentSeparator
+     * @return
+     */
+    public static List<String> split(String sql, String segmentSeparator) {
+        if (StringUtils.isEmpty(segmentSeparator)) {
+            return Collections.singletonList(sql);
+        }
+
+        String[] lines = sql.split(segmentSeparator);
+        List<String> segments = new ArrayList<>();
+        for (String line : lines) {
+            if (line.trim().isEmpty() || line.startsWith("--")) {
+                continue;
+            }
+            segments.add(line);
+        }
+        return segments;
+    }
+
+    /**
      * execute function and sql
      *
-     * @param mainSqlBinds main sql binds
+     * @param mainStatementsBinds main sql binds
      * @param preStatementsBinds pre statements binds
      * @param postStatementsBinds post statements binds
      * @param createFuncs create functions
      */
-    public void executeFuncAndSql(SqlBinds mainSqlBinds,
+    public void executeFuncAndSql(List<SqlBinds> mainStatementsBinds,
                                   List<SqlBinds> preStatementsBinds,
                                   List<SqlBinds> postStatementsBinds,
                                   List<String> createFuncs) throws Exception {
         Connection connection = null;
-        PreparedStatement stmt = null;
-        ResultSet resultSet = null;
+        // PreparedStatement stmt = null;
+        // ResultSet resultSet = null;
         try {
 
             // create connection
@@ -186,8 +218,11 @@ public class SqlTask extends AbstractTaskExecutor {
                 createTempFunction(connection, createFuncs);
             }
 
+            /**
+             *
+             // 改造支持多条sql语句执行
             // pre sql
-            preSql(connection, preStatementsBinds);
+            // preSql(connection, preStatementsBinds);
             stmt = prepareStatementAndBind(connection, mainSqlBinds);
 
             String result = null;
@@ -205,11 +240,33 @@ public class SqlTask extends AbstractTaskExecutor {
             //deal out params
             sqlParameters.dealOutParam(result);
             postSql(connection, postStatementsBinds);
+             */
+
+            // pre execute
+            executeUpdate(connection, preStatementsBinds, "pre");
+
+            // main execute
+            String result = null;
+            // decide whether to executeQuery or executeUpdate based on sqlType
+            if (sqlParameters.getSqlType() == SqlType.QUERY.ordinal()) {
+                // query statements need to be convert to JsonArray and inserted into Alert to send
+                result = executeQuery(connection, mainStatementsBinds.get(0), "main");
+            } else if (sqlParameters.getSqlType() == SqlType.NON_QUERY.ordinal()) {
+                // non query statement
+                String updateResult = executeUpdate(connection, mainStatementsBinds, "main");
+                result = setNonQuerySqlReturn(updateResult, sqlParameters.getLocalParams());
+            }
+
+            //deal out params
+            sqlParameters.dealOutParam(result);
+
+            // post execute
+            executeUpdate(connection, postStatementsBinds, "post");
         } catch (Exception e) {
             logger.error("execute sql error: {}", e.getMessage());
             throw e;
         } finally {
-            close(resultSet, stmt, connection);
+            close(connection);
         }
     }
 
@@ -289,6 +346,26 @@ public class SqlTask extends AbstractTaskExecutor {
         setTaskAlertInfo(taskAlertInfo);
     }
 
+    private String executeQuery(Connection connection, SqlBinds sqlBinds, String handlerType) throws Exception {
+        try (PreparedStatement statement = prepareStatementAndBind(connection, sqlBinds)) {
+            logger.info("{} statement execute query, for sql: {}", handlerType, sqlBinds.getSql());
+            ResultSet resultSet = statement.executeQuery();
+            return resultProcess(resultSet);
+        }
+    }
+
+    private String executeUpdate(Connection connection, List<SqlBinds> statementsBinds, String handlerType) throws Exception {
+        int result = 0;
+        for (SqlBinds sqlBind : statementsBinds) {
+            try (PreparedStatement statement = prepareStatementAndBind(connection, sqlBind)) {
+                result = statement.executeUpdate();
+                logger.info("{} statement execute update result: {}, for sql: {}", handlerType, result, sqlBind.getSql());
+            }
+        }
+        return String.valueOf(result);
+    }
+
+
     /**
      * pre sql
      *
@@ -334,6 +411,21 @@ public class SqlTask extends AbstractTaskExecutor {
             for (String createFunc : createFuncs) {
                 logger.info("hive create function sql: {}", createFunc);
                 funcStmt.execute(createFunc);
+            }
+        }
+    }
+
+    /**
+     * close jdbc resource
+     *
+     * @param connection connection
+     */
+    private void close(Connection connection) {
+        if (connection != null) {
+            try {
+                connection.close();
+            } catch (SQLException e) {
+                logger.error("close connection error : {}", e.getMessage(), e);
             }
         }
     }
